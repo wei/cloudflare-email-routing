@@ -1,0 +1,57 @@
+name: 📧 New Email Forward Request
+description: Request a new email forwarding rule
+title: "[NEW] Email Forwarding Request"
+labels: ["new_forward_request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Email Forward Request
+
+        Use this form to request a new email forwarding rule. The source email will be created and forward all messages to your destination email.
+
+        **Requirements:**
+        - The source email must belong to the managed domain for this repository (e.g., example.com).
+        - The source email must not already exist.
+        - You must have access to the destination email for verification.
+        - An administrator must approve the request before deployment.
+
+  - type: input
+    id: source
+    attributes:
+      label: Source Email
+      description: The new email address to create (e.g., `new-name@example.com`)
+      placeholder: new-name@example.com
+    validations:
+      required: true
+
+  - type: input
+    id: destination
+    attributes:
+      label: Destination Email
+      description: Your existing email address where messages should be forwarded
+      placeholder: your-email@gmail.com
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose / Use Case
+      description: Briefly describe why you need this email forward
+      placeholder: This email will be used for ...
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Verification Requirements
+      description: Please confirm you understand the process
+      options:
+        - label: I have access to the destination email address and can click verification links.
+          required: true
+        - label: I understand that an administrator must approve this request before it becomes active.
+          required: true
+        - label: I understand that I will be able to remove this forward myself by opening a new issue.
+          required: true

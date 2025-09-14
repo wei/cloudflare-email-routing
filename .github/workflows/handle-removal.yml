@@ -1,0 +1,214 @@
+name: Handle Removal Requests
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  process-removal:
+    if: contains(github.event.issue.labels.*.name, 'remove_forward_request')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: email-forwards-registry
+      cancel-in-progress: false
+
+    outputs:
+      deploy: ${{ steps.deploy-flag.outputs.deploy }}
+      owner: ${{ steps.remove.outputs.owner }}
+
+    permissions:
+      issues: write
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse issue body for source email
+        id: parse
+        run: |
+          source=$(echo "${{ github.event.issue.body }}" | awk '/### Source Email to Remove/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+          # Normalize to lowercase
+          source=$(echo "$source" | tr '[:upper:]' '[:lower:]')
+
+          # Validate email format
+          if ! echo "$source" | grep -E '^[a-zA-Z0-9._%-=]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+            echo "Invalid source email format: $source"
+            exit 1
+          fi
+
+          echo "source=$source" >> $GITHUB_OUTPUT
+
+      - name: Check ownership and remove forward
+        id: remove
+        run: |
+          source="${{ steps.parse.outputs.source }}"
+          requester="${{ github.event.issue.user.login }}"
+          admin_users="${{ vars.ADMIN_USERS }}"
+
+          # Check if the forward exists and get its owner
+          if [ ! -f email_forwards.json ]; then
+            echo "error=Registry file not found" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if the source exists in the registry and get the owner
+          owner=$(jq -r --arg source "$source" '.forwards[] | select(.source == $source) | .owner' email_forwards.json)
+
+          if [ -z "$owner" ] || [ "$owner" = "null" ]; then
+            echo "error=Forward not found" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if requester is either the owner or an admin user
+          is_authorized=false
+
+          # Check if requester is the owner
+          if [ "$owner" = "$requester" ]; then
+            is_authorized=true
+          fi
+
+          # Check if requester is an admin user
+          if [ "$is_authorized" = "false" ] && [ -n "$admin_users" ]; then
+            # Convert comma-separated list to array and check if requester is in it
+            IFS=',' read -ra admin_array <<< "$admin_users"
+            for admin in "${admin_array[@]}"; do
+              # Trim whitespace
+              admin=$(echo "$admin" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+              if [ "$admin" = "$requester" ]; then
+                is_authorized=true
+                break
+              fi
+            done
+          fi
+
+          # If not authorized, return error
+          if [ "$is_authorized" = "false" ]; then
+            echo "error=Ownership mismatch" >> $GITHUB_OUTPUT
+            echo "actual_owner=$owner" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Remove the forward from registry
+          jq --arg source "$source" '.forwards |= map(select(.source != $source))' email_forwards.json > temp_forwards.json && mv temp_forwards.json email_forwards.json
+
+          echo "success=true" >> $GITHUB_OUTPUT
+          echo "owner=$owner" >> $GITHUB_OUTPUT
+
+      - name: Handle removal errors
+        if: steps.remove.outputs.error != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const error = '${{ steps.remove.outputs.error }}';
+            const source = '${{ steps.parse.outputs.source }}';
+            const requester = '${{ github.event.issue.user.login }}';
+
+            let errorMessage = '';
+
+            if (error === 'Registry file not found') {
+              errorMessage = `❌ **Removal Failed: No Email Forwards Configured**
+
+              The email forwards registry is empty or does not exist. There are no forwards to remove.`;
+            } else if (error === 'Forward not found') {
+              errorMessage = `❌ **Removal Failed: Email Forward Not Found**
+
+              The email forward for \`${source}\` does not exist in the system.
+
+              Please check the source email address and try again.`;
+            } else if (error === 'Ownership mismatch') {
+              const actualOwner = '${{ steps.remove.outputs.actual_owner }}';
+              errorMessage = `❌ **Removal Failed: Ownership Verification Failed**
+
+              You (@${requester}) are not authorized to remove the email forward \`${source}\`.
+
+              This forward is owned by @${actualOwner}. Only the original requester or an admin can remove forwards.
+
+              If you believe this is an error, please contact an administrator.`;
+            }
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: errorMessage + '\n\nThis issue will be automatically closed.'
+            });
+
+            await github.rest.issues.update({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            });
+
+      - name: Commit removal
+        if: steps.remove.outputs.success == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add email_forwards.json
+          git commit --allow-empty -m "Remove email forward ${{ steps.parse.outputs.source }} via #${{ github.event.issue.number }}"
+          git push
+
+      - name: Deploy changes
+        if: steps.remove.outputs.success == 'true'
+        id: deploy-flag
+        run: echo "deploy=true" >> $GITHUB_OUTPUT
+
+  cloudflare-apply:
+    needs: process-removal
+    if: needs.process-removal.outputs.deploy == 'true'
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/cloudflare-apply.yml
+    with:
+      issue_number: ${{ github.event.issue.number }}
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  finalize-removal:
+    needs: [process-removal, cloudflare-apply]
+    if: needs.process-removal.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Parse issue data for final comment
+        id: parse-final
+        run: |
+          source=$(echo "${{ github.event.issue.body }}" | awk '/### Source Email to Remove/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          echo "source=$source" >> $GITHUB_OUTPUT
+
+      - name: Close issue with success message
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🗑️ **Email Forward Removed Successfully**
+
+              The email forward for \`${{ steps.parse-final.outputs.source }}\` has been removed from the system.
+
+              - **Removed by:** @${{ github.event.issue.user.login }}
+
+              ✅ The forward is no longer active and emails will no longer be routed.
+
+              Thank you for using the self-service email forwarding system!`
+            });
+
+            await github.rest.issues.update({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            });

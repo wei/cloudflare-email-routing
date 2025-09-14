@@ -1,0 +1,46 @@
+name: 🗑️ Remove Email Forward
+description: Remove an existing email forwarding rule that you own
+title: "[REMOVE] Email Forwarding Removal"
+labels: ["remove_forward_request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Remove Email Forward
+
+        Use this form to remove an email forwarding rule that you previously created.
+
+        **Important:**
+        - The source email must belong to the managed domain for this repository (e.g., example.com).
+        - You can only remove forwards that you originally requested.
+        - Emails sent to the source address will no longer be forwarded.
+        - The source email address will be available for others to request again.
+
+  - type: input
+    id: source
+    attributes:
+      label: Source Email to Remove
+      description: The email address you want to stop forwarding (e.g., `email-to-remove@example.com`)
+      placeholder: email-to-remove@example.com
+    validations:
+      required: true
+
+  - type: textarea
+    id: reason
+    attributes:
+      label: Reason for Removal
+      description: Briefly explain why you're removing this forward
+      placeholder: Email is no longer needed because ...
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      description: Please confirm you understand this action
+      options:
+        - label: I confirm that I want to remove this email forward. It will become available for others to request.
+          required: true
+        - label: I confirm that I am the original owner of this email forward.
+          required: true

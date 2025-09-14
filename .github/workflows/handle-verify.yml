@@ -1,0 +1,118 @@
+name: Handle Verification Comments
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle-verify:
+    if: github.event.comment.body == '/verify' && contains(github.event.issue.labels.*.name, 'pending-verification')
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse original issue for destination email
+        id: parse
+        run: |
+          # Get the issue body and extract destination email
+          destination=$(echo "${{ github.event.issue.body }}" | awk '/### Destination Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          # Normalize to lowercase
+          destination=$(echo "$destination" | tr '[:upper:]' '[:lower:]')
+          echo "destination=$destination" >> $GITHUB_OUTPUT
+
+      - name: Check verification status with Cloudflare
+        id: verify
+        uses: wei/cloudflare-script@master
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        with:
+          script: |
+            const destination = '${{ steps.parse.outputs.destination }}';
+
+            console.log(`🔍 Checking verification status for: ${destination}`);
+
+            try {
+              // Get all existing email routing addresses using auto-pagination
+              let verified = false;
+              for await (const address of cloudflare.emailRouting.addresses.list({
+                account_id: '${{ secrets.CLOUDFLARE_ACCOUNT_ID }}'
+              })) {
+                if (address.email === destination && address.verified) {
+                  verified = true;
+                  console.log(`✅ Address ${destination} is verified`);
+                  break;
+                }
+              }
+
+              if (!verified) {
+                console.log(`❌ Address ${destination} is not verified yet`);
+              }
+
+              return { verified };
+            } catch (error) {
+              console.log(`❌ Failed to check verification status: ${error.message}`);
+              throw error;
+            }
+
+      - name: Handle successful verification
+        if: fromJSON(steps.verify.outputs.result).verified == true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Remove pending-verification label and add pending-approval
+            await github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'pending-verification'
+            });
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Email Verification Successful!**
+
+              Your destination email has been verified with Cloudflare.
+
+              🔍 **Status:** Awaiting administrator approval
+
+              An administrator will review your request and apply the \`approved\` label to proceed with deployment. You will be notified when the email forward is active.
+
+              Thank you for your patience!`
+            });
+
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['pending-approval']
+            });
+
+      - name: Handle failed verification
+        if: fromJSON(steps.verify.outputs.result).verified == false
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Email Verification Failed**
+
+              The destination email \`${{ steps.parse.outputs.destination }}\` has not been verified yet.
+
+              Please ensure you:
+              1. Check your email inbox (including spam/junk folders)
+              2. Click the verification link from Cloudflare
+              3. Wait a few minutes for the verification to process
+              4. Comment \`/verify\` again
+
+              If you continue having issues, please check that the email address is correct and accessible.`
+            });

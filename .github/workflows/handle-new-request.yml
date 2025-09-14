@@ -1,0 +1,228 @@
+name: Handle New Email Forward Requests
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  process-new-request:
+    if: contains(github.event.issue.labels.*.name, 'new_forward_request')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: email-forwards-registry
+      cancel-in-progress: false
+
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse issue body
+        id: parse
+        run: |
+          # Extract source and destination from issue body
+          source=$(echo "${{ github.event.issue.body }}" | awk '/### Source Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          destination=$(echo "${{ github.event.issue.body }}" | awk '/### Destination Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+          # Normalize: trim already done; enforce lowercase
+          source=$(echo "$source" | tr '[:upper:]' '[:lower:]')
+          destination=$(echo "$destination" | tr '[:upper:]' '[:lower:]')
+
+          # Validate email format
+          if ! echo "$source" | grep -E '^[a-zA-Z0-9._%-=]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+            echo "Invalid source email format: $source"
+            echo "validation_error=Invalid source email format: $source" >> $GITHUB_OUTPUT
+          fi
+
+          if ! echo "$destination" | grep -E '^[a-zA-Z0-9._%-=]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+            echo "Invalid destination email format: $destination"
+            echo "validation_error=Invalid destination email format: $destination" >> $GITHUB_OUTPUT
+          fi
+
+          # Validate source email domain matches DOMAIN_NAME variable (subdomains allowed)
+          expected_domain='${{ vars.DOMAIN_NAME }}'
+          if [ -z "$expected_domain" ]; then
+            echo "Repository variable DOMAIN_NAME is not set."
+            echo "validation_error=Repository variable DOMAIN_NAME is not set" >> $GITHUB_OUTPUT
+          else
+            source_domain=$(echo "$source" | awk -F'@' '{print $2}')
+            expected_domain_lc=$(echo "$expected_domain" | tr '[:upper:]' '[:lower:]')
+            case "$source_domain" in
+              "$expected_domain_lc"|*."$expected_domain_lc")
+                : # ok
+                ;;
+              *)
+                echo "Source email must be under domain $expected_domain: $source"
+                echo "validation_error=Source email must be under domain $expected_domain (subdomains allowed): $source" >> $GITHUB_OUTPUT
+                ;;
+            esac
+          fi
+
+          echo "source=$source" >> $GITHUB_OUTPUT
+          echo "destination=$destination" >> $GITHUB_OUTPUT
+
+      - name: Handle validation error
+        if: ${{ steps.parse.outputs.validation_error != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Request Failed: Invalid Email Format**
+
+              \`\`\`
+              ${{ steps.parse.outputs.validation_error }}
+              \`\`\`
+
+              Please check your request and update the issue with valid email addresses.`
+            });
+
+            await github.rest.issues.update({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            });
+
+      - name: Check for existing forward
+        id: collision-check
+        if: ${{ steps.parse.outputs.validation_error == '' }}
+        run: |
+          source="${{ steps.parse.outputs.source }}"
+
+          if [ -f email_forwards.json ]; then
+            if jq -e --arg source "$source" '.forwards[] | select(.source == $source)' email_forwards.json > /dev/null; then
+              echo "collision=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          echo "collision=false" >> $GITHUB_OUTPUT
+
+      - name: Handle collision
+        if: steps.collision-check.outputs.collision == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Request Failed: Email Address Already in Use**
+
+              The source email address \`${{ steps.parse.outputs.source }}\` is already configured in the system.
+
+              Please check with the owner of the existing forwards in the \`email_forwards.json\` file or choose a different source email address.
+
+              This issue will be automatically closed.`
+            });
+
+            await github.rest.issues.update({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            });
+
+      - name: Create destination address in Cloudflare
+        if: steps.collision-check.outputs.collision == 'false'
+        id: cloudflare-create
+        uses: wei/cloudflare-script@master
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        with:
+          script: |
+            const destination = '${{ steps.parse.outputs.destination }}';
+
+            console.log(`📮 Creating destination address: ${destination}`);
+
+            try {
+              // Create destination address to trigger verification email
+              const response = await cloudflare.emailRouting.addresses.create({
+                account_id: '${{ secrets.CLOUDFLARE_ACCOUNT_ID }}',
+                email: destination
+              });
+
+              console.log('✅ Destination address created');
+
+              // Check if the address is already verified
+              const verified = response.verified;
+
+              if (verified) {
+                console.log('🎉 Address is already verified');
+                return { verified: true };
+              } else {
+                console.log('📧 Verification email sent');
+                return { verified: false };
+              }
+            } catch (error) {
+              console.log(`❌ Failed to create address: ${error.message}`);
+              throw error;
+            }
+
+      - name: Add verification instructions
+        if: steps.collision-check.outputs.collision == 'false' && fromJSON(steps.cloudflare-create.outputs.result).verified == false
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🔄 **Request Received**
+
+              Thank you for your email forward request:
+              - **From:** \`${{ steps.parse.outputs.source }}\`
+              - **To:** \`${{ steps.parse.outputs.destination }}\`
+
+              📧 **Next Step: Verify Your Destination Email**
+
+              A verification email has been sent to \`${{ steps.parse.outputs.destination }}\`. Please:
+
+              1. Check your inbox (including spam folder)
+              2. Click the verification link in the email from Cloudflare
+              3. Return here and comment \`/verify\` to continue
+
+              ⏰ This request will automatically close if not verified within 14 days.`
+            });
+
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['pending-verification']
+            });
+
+      - name: Handle already verified destination
+        if: steps.collision-check.outputs.collision == 'false' && fromJSON(steps.cloudflare-create.outputs.result).verified == true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Request Processed - Destination Already Verified**
+
+              Thank you for your email forward request:
+              - **From:** \`${{ steps.parse.outputs.source }}\`
+              - **To:** \`${{ steps.parse.outputs.destination }}\`
+
+              🎉 **Good news!** The destination email address is already verified in Cloudflare.
+
+              🔍 **Status:** Awaiting administrator approval
+
+              An administrator will review your request and apply the \`approved\` label to proceed with deployment. You will be notified when the email forward is active.`
+            });
+
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['pending-approval']
+            });

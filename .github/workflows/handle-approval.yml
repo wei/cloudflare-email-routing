@@ -1,0 +1,187 @@
+name: Handle Approval and Deployment
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  handle-approval:
+    if: github.event.label.name == 'approved' && contains(github.event.issue.labels.*.name, 'pending-approval')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: email-forwards-registry
+      cancel-in-progress: false
+
+    outputs:
+      deploy: ${{ steps.deploy-flag.outputs.deploy }}
+
+    permissions:
+      issues: write
+      contents: write
+
+    steps:
+      - name: Check if user is authorized to approve
+        id: auth-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.actor;
+            const adminUsers = '${{ vars.ADMIN_USERS }}';
+
+            let isAuthorized = false;
+
+            // Check if actor is in admin users list
+            if (adminUsers) {
+              const userList = adminUsers.split(',').map(u => u.trim());
+              if (userList.includes(actor)) {
+                isAuthorized = true;
+              }
+            }
+
+            if (!isAuthorized) {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `❌ **Unauthorized Approval Attempt**
+
+                @${actor} is not authorized to approve email forward requests.
+
+                Only members of the admin team or users listed in ADMIN_USERS can approve requests.`
+              });
+
+              await github.rest.issues.removeLabel({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'approved'
+              });
+
+              core.setFailed('User not authorized to approve requests');
+              return;
+            }
+
+            core.setOutput('authorized', 'true');
+
+      - name: Checkout repository
+        if: steps.auth-check.outputs.authorized == 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse issue body
+        if: steps.auth-check.outputs.authorized == 'true'
+        id: parse
+        run: |
+          source=$(echo "${{ github.event.issue.body }}" | awk '/### Source Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          destination=$(echo "${{ github.event.issue.body }}" | awk '/### Destination Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+
+          # Normalize to lowercase
+          source=$(echo "$source" | tr '[:upper:]' '[:lower:]')
+          destination=$(echo "$destination" | tr '[:upper:]' '[:lower:]')
+          owner="${{ github.event.issue.user.login }}"
+
+          echo "source=$source" >> $GITHUB_OUTPUT
+          echo "destination=$destination" >> $GITHUB_OUTPUT
+          echo "owner=$owner" >> $GITHUB_OUTPUT
+
+      - name: Update email forwards registry
+        if: steps.auth-check.outputs.authorized == 'true'
+        run: |
+          source="${{ steps.parse.outputs.source }}"
+          destination="${{ steps.parse.outputs.destination }}"
+          owner="${{ steps.parse.outputs.owner }}"
+
+          # Read current JSON, add new forward, remove duplicates, and sort
+          jq --arg source "$source" --arg destination "$destination" --arg owner "$owner" '
+            .forwards += [{"source": $source, "destination": $destination, "owner": $owner}] |
+            .forwards |= unique_by(.source + "|" + .destination) |
+            .forwards |= sort_by(.source)
+          ' email_forwards.json > temp_forwards.json && mv temp_forwards.json email_forwards.json
+
+      - name: Commit changes
+        if: steps.auth-check.outputs.authorized == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          git add email_forwards.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit (duplicate or no-op)."
+          else
+            git commit --allow-empty -m "Add email forward ${{ steps.parse.outputs.source }} -> ${{ steps.parse.outputs.destination }} via #${{ github.event.issue.number }}"
+            git push
+          fi
+
+      - name: Set deployment flag
+        if: steps.auth-check.outputs.authorized == 'true'
+        id: deploy-flag
+        run: echo "deploy=true" >> $GITHUB_OUTPUT
+
+  cloudflare-apply:
+    needs: handle-approval
+    if: needs.handle-approval.outputs.deploy == 'true'
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/cloudflare-apply.yml
+    with:
+      issue_number: ${{ github.event.issue.number }}
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  finalize-approval:
+    needs: [handle-approval, cloudflare-apply]
+    if: needs.handle-approval.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Parse issue data for final comment
+        id: parse-final
+        run: |
+          # This will be re-parsed from the issue, could be optimized by passing data between jobs
+          source=$(echo "${{ github.event.issue.body }}" | awk '/### Source Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          destination=$(echo "${{ github.event.issue.body }}" | awk '/### Destination Email/{getline; getline; print; exit}' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+          owner="${{ github.event.issue.user.login }}"
+
+          echo "source=$source" >> $GITHUB_OUTPUT
+          echo "destination=$destination" >> $GITHUB_OUTPUT
+          echo "owner=$owner" >> $GITHUB_OUTPUT
+
+      - name: Close issue with success message
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 **Email Forward Deployed Successfully!**
+
+              Your email forward has been approved and deployed:
+              - **From:** \`${{ steps.parse-final.outputs.source }}\`
+              - **To:** \`${{ steps.parse-final.outputs.destination }}\`
+              - **Owner:** @${{ steps.parse-final.outputs.owner }}
+
+              ✅ The forward is now active and will route emails immediately.
+
+              Thank you for using the self-service email forwarding system!`
+            });
+
+            await github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'pending-approval'
+            });
+
+            await github.rest.issues.update({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed'
+            });

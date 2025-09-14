@@ -1,0 +1,110 @@
+name: Cleanup Stale Verification Requests
+
+on:
+  schedule:
+    # Run weekly on Sunday at 9:00 AM UTC
+    - cron: "0 9 * * 0"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  cleanup-stale-requests:
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write
+
+    steps:
+      - name: Find and handle stale verification requests
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'pending-verification',
+              state: 'open'
+            });
+
+            const fourteenDaysAgo = new Date();
+            fourteenDaysAgo.setDate(fourteenDaysAgo.getDate() - 14);
+
+            const sevenDaysAgo = new Date();
+            sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+            for (const issue of issues) {
+              const createdAt = new Date(issue.created_at);
+
+              if (createdAt < fourteenDaysAgo) {
+                // Close issues older than 14 days
+                await github.rest.issues.createComment({
+                  issue_number: issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: `⏰ **Request Automatically Closed - Verification Timeout**
+
+                  This email forward request has been automatically closed because the destination email was not verified within 14 days.
+
+                  If you still need this email forward, please open a new request and complete the verification process promptly.
+
+                  **Next steps:**
+                  1. Open a new "New Email Forward Request" issue
+                  2. Check your email for the Cloudflare verification message
+                  3. Click the verification link and comment \`/verify\`
+
+                  Thank you for using the self-service email forwarding system.`
+                });
+
+                await github.rest.issues.update({
+                  issue_number: issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: 'closed'
+                });
+
+                console.log(`Closed stale issue #${issue.number} (created ${createdAt.toISOString()})`);
+
+              } else if (createdAt < sevenDaysAgo) {
+                // Send reminder for issues 7-14 days old
+                const { data: comments } = await github.rest.issues.listComments({
+                  issue_number: issue.number,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo
+                });
+
+                // Only send reminder if we haven't already sent one
+                const hasReminder = comments.some(comment =>
+                  comment.body.includes('📬 **Verification Reminder**')
+                );
+
+                if (!hasReminder) {
+                  await github.rest.issues.createComment({
+                    issue_number: issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body: `📬 **Verification Reminder**
+
+                    This email forward request is still waiting for email verification.
+
+                    **To complete your request:**
+                    1. Check your email inbox (including spam folder) for a message from Cloudflare
+                    2. Click the verification link in that email
+                    3. Return here and comment \`/verify\`
+
+                    ⚠️ **This request will be automatically closed in 7 days if not verified.**
+
+                    If you're having trouble finding the verification email, please check that the destination email address is correct and accessible.`
+                  });
+
+                  console.log(`Sent reminder for issue #${issue.number} (created ${createdAt.toISOString()})`);
+                }
+              }
+            }
+
+            console.log(`Processed ${issues.length} pending verification requests`);
+
+      - name: Report cleanup summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('Stale verification cleanup completed successfully');
+            console.log('Next run: ' + new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString());

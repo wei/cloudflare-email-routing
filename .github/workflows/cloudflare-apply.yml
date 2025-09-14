@@ -1,0 +1,256 @@
+name: Apply Email Routing via Cloudflare TypeScript SDK
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        required: false
+        type: string
+        description: "Issue number that triggered this deployment"
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ZONE_ID:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+  workflow_dispatch:
+
+jobs:
+  cloudflare-apply:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      issues: write
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Ensure we checkout the latest commit on the default branch,
+          # not the workflow run's initial SHA from an issues event.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Apply email routing configuration
+        id: apply
+        uses: wei/cloudflare-script@master
+        with:
+          script: |
+            // Read and parse the email forwards JSON file
+            const fs = require('fs');
+
+            console.log('📧 Applying email routing configuration...');
+
+            // Read email forwards configuration
+            const jsonFile = 'email_forwards.json';
+            if (!fs.existsSync(jsonFile)) {
+              throw new Error(`❌ Error: JSON file ${jsonFile} not found`);
+            }
+
+            const emailConfig = JSON.parse(fs.readFileSync(jsonFile, 'utf8'));
+            // Normalize forwards to lowercase for consistent processing
+            const forwards = (emailConfig.forwards || []).map(f => ({
+              source: String(f.source || '').trim().toLowerCase(),
+              destination: String(f.destination || '').trim().toLowerCase(),
+              owner: f.owner
+            }));
+
+            console.log('🔍 Fetching existing email routing configuration...');
+
+            // Get all existing email routing addresses using auto-pagination
+            const existingAddresses = [];
+            for await (const address of cloudflare.emailRouting.addresses.list({
+              account_id: '${{ secrets.CLOUDFLARE_ACCOUNT_ID }}'
+            })) {
+              existingAddresses.push(address);
+            }
+
+            // Get all existing email routing rules using auto-pagination
+            const existingRules = [];
+            for await (const rule of cloudflare.emailRouting.rules.list({
+              zone_id: '${{ secrets.CLOUDFLARE_ZONE_ID }}'
+            })) {
+              if (rule.matchers?.[0]?.type === 'literal') {
+                existingRules.push(rule);
+              }
+            }
+
+            console.log(`📊 Found ${existingAddresses.length} existing addresses and ${existingRules.length} existing rules`);
+
+            const counts = {
+              processed: 0,
+              createdRules: 0,
+              skippedRules: 0,
+              deletedRules: 0,
+              deletedErrors: 0,
+              createdErrors: 0
+            };
+
+            // First, identify and remove rules that are no longer in the forwards configuration
+            console.log('🧹 Checking for rules to remove...');
+            const configuredForwards = new Set(forwards.map(f => `${f.source} -> ${f.destination}`));
+
+            for (const rule of existingRules) {
+              const ruleSource = rule.matchers?.[0]?.value?.toLowerCase();
+              const ruleDestination = rule.actions?.[0]?.value?.[0]?.toLowerCase();
+
+              if (ruleSource) {
+                const ruleKey = `${ruleSource} -> ${ruleDestination}`;
+
+                if (!configuredForwards.has(ruleKey)) {
+                  console.log(`  🗑️  Removing rule for ${ruleKey} (no longer in configuration)`);
+                  try {
+                    await cloudflare.emailRouting.rules.delete(rule.id, {
+                      zone_id: '${{ secrets.CLOUDFLARE_ZONE_ID }}'
+                    });
+                    counts.deletedRules++;
+                    console.log('  ✅ Routing rule deleted');
+                  } catch (error) {
+                    console.log(`  ❌ Failed to delete rule: ${error.message}`);
+                    counts.deletedErrors++;
+                  }
+                }
+              }
+            }
+
+            if (forwards.length === 0) {
+              console.log('📭 No forwards found in email_forwards.json');
+              return {
+                counts: {
+                  processed: 0,
+                  createdRules: 0,
+                  skippedRules: 0,
+                  deletedRules: counts.deletedRules,
+                  createdErrors: 0,
+                  deletedErrors: 0
+                },
+                summary: `No forwards to process, deleted ${counts.deletedRules} existing rules`
+              };
+            }
+
+            // Process each forward
+            for (const forward of forwards) {
+              const { source, destination, owner } = forward;
+              console.log(`📨 Processing forward: ${source} -> ${destination} (owner: ${owner})`);
+
+              // Check if destination address exists and is verified
+              const existingAddress = existingAddresses.find(addr => (addr.email || '').toLowerCase() === destination);
+
+              if (!existingAddress || !existingAddress.verified) {
+                console.log(`  ❌ Destination address does not exist or is not verified`);
+                continue;
+              } else {
+                console.log('  ✅ Destination address already exists and verified');
+              }
+
+              // Check if rule already exists
+              const existingRule = existingRules.find(rule =>
+                (rule.matchers?.[0]?.value || '').toLowerCase() === source
+              );
+
+              if (existingRule) {
+                console.log(`  ⏭️  Rule already exists for ${source}`);
+                counts.skippedRules++;
+              } else {
+                console.log(`  🔧 Creating routing rule: ${source} -> ${destination}`);
+                try {
+                  await cloudflare.emailRouting.rules.create({
+                    zone_id: '${{ secrets.CLOUDFLARE_ZONE_ID }}',
+                    name: `Forward ${source} to ${destination}`,
+                    enabled: true,
+                    matchers: [
+                      {
+                        type: 'literal',
+                        field: 'to',
+                        value: source
+                      }
+                    ],
+                    actions: [
+                      {
+                        type: 'forward',
+                        value: [destination]
+                      }
+                    ]
+                  });
+                  counts.createdRules++;
+                  console.log('  ✅ Routing rule created');
+                } catch (error) {
+                  console.log(`  ❌ Failed to create rule: ${error.message}`);
+                  counts.createdErrors++;
+                }
+              }
+            }
+
+            counts.processed = forwards.length;
+
+            console.log('');
+            console.log('📊 Summary:');
+            console.log(`  📧 Total forwards processed: ${counts.processed}`);
+            console.log(`  🔧 Routing rules created: ${counts.createdRules}`);
+            console.log(`  ⏭️  Rules skipped (already exist): ${counts.skippedRules}`);
+            console.log(`  🗑️  Rules deleted (no longer configured): ${counts.deletedRules}`);
+            console.log(`  ❌ Rule creation errors: ${counts.createdErrors}`);
+            console.log(`  ❌ Rule deletion errors: ${counts.deletedErrors}`);
+            console.log('✅ Email routing configuration applied successfully!');
+
+            return {
+              counts,
+              summary: `Processed ${counts.processed} forwards, created ${counts.createdRules} rules, deleted ${counts.deletedRules} rules`
+            };
+
+      - name: Comment on issue if provided
+        if: inputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = JSON.parse('${{ steps.apply.outputs.result }}');
+
+            let summary = '';
+            if (result.counts.processed > 0) summary += `- 📧 Forwards processed: ${result.counts.processed}\n`;
+            if (result.counts.createdRules > 0) summary += `- 🔧 Routing rules created: ${result.counts.createdRules}\n`;
+            if (result.counts.skippedRules > 0) summary += `- ⏭️ Rules skipped (already exist): ${result.counts.skippedRules}\n`;
+            if (result.counts.deletedRules > 0) summary += `- 🗑️ Rules deleted (no longer configured): ${result.counts.deletedRules}\n`;
+            if (result.counts.createdErrors > 0) summary += `- ❌ Rule creation errors: ${result.counts.createdErrors}\n`;
+            if (result.counts.deletedErrors > 0) summary += `- ❌ Rule deletion errors: ${result.counts.deletedErrors}\n`;
+
+            await github.rest.issues.createComment({
+              issue_number: ${{ inputs.issue_number }},
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `📋 **Email Routing Configuration Deployed**
+
+              The email routing configuration has been deployed successfully to Cloudflare.
+
+              <details>
+              <summary>See details</summary>
+
+              ${summary}
+              </details>`
+            });
+
+      - name: Handle API failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            if ('${{ inputs.issue_number }}' !== '') {
+              await github.rest.issues.createComment({
+                issue_number: ${{ inputs.issue_number }},
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `❌ **Email Routing Configuration Failed**
+
+                There was an error applying the email routing configuration via Cloudflare TypeScript SDK. Please check the workflow logs for details.
+
+                An administrator will need to investigate and resolve this issue.`
+              });
+            }
+
+            core.setFailed('Email routing configuration failed');
