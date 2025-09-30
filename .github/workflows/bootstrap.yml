@@ -1,0 +1,134 @@
+name: (Initial Setup) Bootstrap
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    name: Prepare repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CONFIGURED_DOMAIN: ${{ vars.DOMAIN_NAME }}
+      ADMIN_USERS: ${{ vars.ADMIN_USERS }}
+      BOOTSTRAP_WORKFLOW_PATH: .github/workflows/bootstrap.yml
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Validate repository configuration
+        id: validate
+        run: |
+          set -euo pipefail
+
+          missing=()
+
+          check_var() {
+            local value="$1"
+            local label="$2"
+            if [ -z "$value" ]; then
+              missing+=("$label")
+            fi
+          }
+
+          check_var "$CLOUDFLARE_API_TOKEN" "CLOUDFLARE_API_TOKEN secret"
+          check_var "$CLOUDFLARE_ZONE_ID" "CLOUDFLARE_ZONE_ID secret"
+          check_var "$CLOUDFLARE_ACCOUNT_ID" "CLOUDFLARE_ACCOUNT_ID secret"
+          check_var "$ADMIN_USERS" "ADMIN_USERS repository variable"
+          check_var "$CONFIGURED_DOMAIN" "DOMAIN_NAME repository variable"
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            {
+              echo "## Missing configuration"
+              for entry in "${missing[@]}"; do
+                echo "- $entry"
+              done
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Required configuration is missing."
+            exit 1
+          fi
+
+          echo "All required secrets and variables are present." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm Cloudflare zone matches domain
+        id: zone
+        uses: wei/cloudflare-script@master
+        with:
+          script: |
+            const domain = '${{ vars.DOMAIN_NAME }}'.toLowerCase();
+
+            console.log(`🔍 Fetching zone id to verify ${domain}...`);
+
+            const zone = await cloudflare.zones.get({ zone_id: '${{ secrets.CLOUDFLARE_ZONE_ID }}' });
+            const zoneName = zone?.name.toLowerCase();
+
+            if (!zoneName) {
+              throw new Error(`Unable to retrieve the zone name for the provided zone id.`);
+            }
+
+            if (zoneName !== domain) {
+              throw new Error(`Configured zone (${zoneName}) does not match repository domain (${domain}).`);
+            }
+
+            console.log(`✅ Cloudflare zone ${zoneName} matches ${domain}.`);
+
+      - name: Ensure required issue labels exist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = [
+              { name: 'pending-verification', color: 'ff9500', description: 'Applied when waiting for email verification' },
+              { name: 'pending-approval', color: 'fbca04', description: 'Applied when waiting for admin approval' },
+              { name: 'approved', color: '0e8a16', description: 'Manually applied by admins to trigger deployment' },
+              { name: 'new_forward_request', color: '0052cc', description: 'Applied to new forward requests' },
+              { name: 'remove_forward_request', color: 'd73a49', description: 'Applied to removal requests' }
+            ];
+
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ...label
+                });
+                core.info(`Created label ${label.name}`);
+              } catch (error) {
+                if (error.status === 422) {
+                  core.info(`Label ${label.name} already exists.`);
+                } else if (error.status === 403) {
+                  core.warning(`Permission issue while creating ${label.name}: ${error.message}`);
+                } else {
+                  core.warning(`Failed to create ${label.name}: ${error.message}`);
+                }
+              }
+            }
+
+      - name: Update documentation and templates
+        run: |
+          perl -i -pe "s/example\.com/$CONFIGURED_DOMAIN/ig" docs/USER_GUIDE.md .github/ISSUE_TEMPLATE/*.yml
+          cp docs/USER_GUIDE.md README.md
+          rm "$BOOTSTRAP_WORKFLOW_PATH"
+
+      - name: Commit changes
+        id: commit
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          if git status --porcelain | grep -q .; then
+            git add -A
+            git commit -m "Bootstrap domain $CONFIGURED_DOMAIN"
+            git push
+          else
+            echo "No changes to commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi

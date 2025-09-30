@@ -41,6 +41,7 @@ The GitHub Actions workflow needs an API token to interact with your Cloudflare 
 2. Click **Create Token** and use the "Create Custom Token" option.
 3. Give the token a descriptive name (e.g., `example.com Email Routing`).
 4. Grant the following permissions:
+   - **Zone** -> **Zone** -> **Read**
    - **Zone** -> **Email Routing** -> **Edit**
    - **Account** -> **Email Routing Addresses** -> **Edit**
 5. Under **Zone Resources**, select the specific zone you want this system to manage (e.g., `example.com`).
@@ -50,7 +51,7 @@ The GitHub Actions workflow needs an API token to interact with your Cloudflare 
 
 ### Add Repository Secrets
 
-Navigate to your repository's **Settings** > **Secrets and variables** > **Actions** to add the following encrypted secrets:
+Navigate to your repository's [**Settings → Secrets and variables → Actions**](../../../settings/secrets/actions/new) to add the following encrypted secrets:
 
 - `CLOUDFLARE_API_TOKEN`: The API token you created in Step 2.
 - `CLOUDFLARE_ZONE_ID`: The Zone ID of your Cloudflare domain, found on the "Overview" page in the Cloudflare dashboard.
@@ -58,22 +59,57 @@ Navigate to your repository's **Settings** > **Secrets and variables** > **Actio
 
 **Note:** The `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ZONE_ID`, and `CLOUDFLARE_ACCOUNT_ID` secrets will be used by the GitHub Actions workflows to authenticate with Cloudflare and manage email routing directly via the Cloudflare API. They are not passed as plain text but are made available as environment variables during workflow execution.
 
-### Define Repository Variables
+### Add Repository Variables
 
-Create the following repository variables:
+Create the following repository variables under [**Settings → Secrets and variables → Actions → Repository variables**](../../../settings/variables/actions/new):
 
-- `ADMIN_USERS`: A comma-delimited list of GitHub usernames who are authorized to approve requests (e.g., `user1,user2,user3`).
 - `DOMAIN_NAME`: The base domain that all source email addresses must belong to (e.g., `example.com`). Subdomains of this domain are also allowed (e.g., `team.example.com`) but requires additional setup in Cloudflare. Requests with a source outside this domain are rejected.
+- `ADMIN_USERS`: A comma-delimited list of GitHub usernames who are authorized to approve requests (e.g., `user1,user2,user3`).
 
 The workflow checks against these variables before proceeding with an `approved` label. Approval can be granted by members of the specified team or any user in the list.
 
+### Run the Bootstrap Workflow
+
+Use the **Bootstrap** GitHub Actions workflow to prepare the repository using the configuration you just added.
+
+1. Go to [**Actions > *Bootstrap* workflow**](../../../actions/workflows/bootstrap.yml).
+2. Click **Run workflow** to start the job.
+3. The workflow verifies required secrets/variables, checks that the Cloudflare zone matches, creates the required issue labels, updates docs and issue templates to the configured domain, replaces `README.md` with the user guide, commits the changes, pushes them to the default branch, and deletes the bootstrap workflow file on success.
+
+<details>
+<summary>Manual fallback steps</summary>
+
+If the automated workflow fails or you prefer to make the changes yourself:
+
+1. Update the `docs/USER_GUIDE.md` file and issue templates in `.github/ISSUE_TEMPLATE` to reflect your specific domain (replace `example.com` with your domain).
+2. Copy the updated `docs/USER_GUIDE.md` to replace `README.md`. This will contain instructions users will see when they visit the repository.
+
+```bash
+# Update domain references in USER_GUIDE.md and issue templates (replace "your-domain.com" with your domain)
+perl -i -pe 's/example\.com/your-domain.com/g' docs/USER_GUIDE.md .github/ISSUE_TEMPLATE/*.yml
+
+# Replace README.md with USER_GUIDE.md content
+cp docs/USER_GUIDE.md README.md
+```
+
+</details>
+
 ### Create Required Issue Labels
 
-The workflow relies on specific labels to track the state of email forward requests.
+The workflow tracks request state using a fixed set of labels:
 
-Create the following labels in your repository's **Issues** section:
+- `pending-verification` (orange `#ff9500`)
+- `pending-approval` (yellow `#fbca04`)
+- `approved` (green `#0e8a16`)
+- `new_forward_request` (blue `#0052cc`)
+- `remove_forward_request` (red `#d73a49`)
 
-### Method 1: Using the GitHub CLI (`gh`) (Recommended)
+The bootstrap workflow described in [Run the Bootstrap Workflow](#run-the-bootstrap-workflow) automatically creates these labels during the initial setup. It is the easiest way to ensure they exist with the correct descriptions and colors.
+
+<details>
+<summary>Manual label creation (only if needed)</summary>
+
+If you ever need to recreate the labels manually, you can use the GitHub CLI:
 
 ```bash
 gh label create "pending-verification" --color "ff9500" --description "Applied when waiting for email verification"
@@ -83,35 +119,13 @@ gh label create "new_forward_request" --color "0052cc" --description "Applied to
 gh label create "remove_forward_request" --color "d73a49" --description "Applied to removal requests"
 ```
 
-### Method 2: Manual Creation
+Or create them through **Issues → Labels** using the names, colors, and descriptions above.
 
-1. Go to your repository's **Issues** tab and click **Labels**.
-2. Create these labels:
-   - `pending-verification` (suggested color: orange `#ff9500`) - Automatically applied by workflow when waiting for user to verify their destination email
-   - `pending-approval` (suggested color: yellow `#fbca04`) - Automatically applied by workflow when verification is complete and waiting for admin approval
-   - `approved` (suggested color: green `#0e8a16`) - **Manually applied by admins** to trigger the deployment workflow
-   - `new_forward_request` (suggested color: blue `#0052cc`) - Automatically applied to new forward requests by the issue template.
-   - `remove_forward_request` (suggested color: red `#d73a49`) - Automatically applied to removal requests by the issue template.
+</details>
 
-**Note:** The workflows automatically manage label transitions. `new_forward_request` and `remove_forward_request` are added automatically when an issue is created. Admins only need to add the `approved` label to trigger deployment.
+**Note:** Workflows manage label transitions automatically—`new_forward_request` and `remove_forward_request` are added on issue creation. Admins only need to apply the `approved` label to trigger deployment.
 
-## Step 4: Prepare README
-
-1. Overwrite `README.md` with contents of `docs/USER_GUIDE.md`. This will contain instructions users will see when they visit the repository.
-2. Update the `docs/USER_GUIDE.md` file to reflect your specific domain.
-3. Update new issue templates in `.github/ISSUE_TEMPLATE` to reflect your specific domain.
-
-**To automate this process, run the following commands:**
-
-```bash
-# Update domain references in USER_GUIDE.md and issue templates (replace "your-domain.com" with your domain)
-perl -i -pe 's/example\.com/your-domain\.com/g' docs/USER_GUIDE.md .github/ISSUE_TEMPLATE/*.yml
-
-# Replace README.md with USER_GUIDE.md content
-cp docs/USER_GUIDE.md README.md
-```
-
-## Step 5: Final Deployment and Testing
+## Step 4: Final Deployment and Testing
 
 1. **Test GitHub Actions Setup:** Ensure all required secrets (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, CLOUDFLARE_ACCOUNT_ID) are properly configured in your repository settings.
 
