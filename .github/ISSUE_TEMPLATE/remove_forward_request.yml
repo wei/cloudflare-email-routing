@@ -11,7 +11,7 @@ body:
         Use this form to remove an email forwarding rule that you previously created.
 
         **Important:**
-        - The source email must belong to the managed domain for this repository (e.g., example.com).
+        - The source email must belong to the managed domain for this repository (e.g., `email-to-remove@example.com`).
         - You can only remove forwards that you originally requested.
         - Emails sent to the source address will no longer be forwarded.
         - The source email address will be available for others to request again.
